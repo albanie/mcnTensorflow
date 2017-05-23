@@ -18,7 +18,7 @@ end
 % the first task is to group rows by layer
 assert(strcmp(rows{1}, '[net]'), 'cfg should begin with a net definition') ;
 current = 'net' ;
-layer = {} ;
+layer = struct() ;
 layers = {} ;
 layerHeader = false ;
 
@@ -36,9 +36,9 @@ for ii = 2:numel(rows)
   fprintf('processing (%d/%d): %s\n', ii, numel(rows), row) ;
 
   if layerHeader
-    disp(layer') ;
+    %disp(layer') ;
     layers{end+1} = layer ;
-    layer = {row} ;
+    layer = struct() ;
     layerHeader = 0 ;
   else
     [startIdx, endIdx] = regexp(row, template) ;
@@ -49,13 +49,12 @@ for ii = 2:numel(rows)
     else 
       % parse key-value pair
       tokens = strsplit(row, '=') ;
-      key = tokens{1} ;
-      values = cellfun(@str2num, strsplit(tokens{2}, ','), 'Uni', 0) ;
-      layer{end+1} = {key, values} ;
+      key = strtrim(tokens{1}) ;
+      values = cellfun(@str2num, strtrim(strsplit(tokens{2}, ',')), 'Uni', 0) ;
+      layer.(key) = [values{:}] ;
     end
   end
 end
-    keyboard
 
 
 if 0
