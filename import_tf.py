@@ -223,7 +223,8 @@ def tf2mcn(node, depth):
         # we want to keep the same variable name and store the padding
         name = mcnIns[0].name
         value = mcnIns[1].value
-        node.mcn = tf_nodes.McnNode(name, value, 'pad')
+        node.mcn = tf_nodes.McnNode(name, value, 'pad', mcnIns)
+
     elif isinstance(node, tf_nodes.TFConv2D):
 
         # construct matconvnet layer name
@@ -240,22 +241,16 @@ def tf2mcn(node, depth):
 
     elif isinstance(node, tf_nodes.TFSub):
         assert len(mcnIns) == 2, 'sub op expects two inputs'
-        ipdb.set_trace()
-        arg1 = mcnIns[0]
-        arg2 = mcnIns[1]
         value = []
-        input_names =  % here
-        node.mcn = tf_nodes.McnNode(node.name, value, 'sub') 
+        node.mcn = tf_nodes.McnNode(node.name, value, 'sub', mcnIns) 
     elif isinstance(node, tf_nodes.TFRealDiv):
         assert len(mcnIns) == 2, 'realdiv op expects two inputs'
-        arg1 = mcnIns[0]
-        arg2 = mcnIns[1]
-        node.mcn = (arg1, arg2, 'div')
+        value = []
+        node.mcn = tf_nodes.McnNode(node.name, value, 'div', mcnIns) 
     elif isinstance(node, tf_nodes.TFMul):
         assert len(mcnIns) == 2, 'mul op expects two inputs'
-        arg1 = mcnIns[0]
-        arg2 = mcnIns[1]
-        node.mcn = (arg1, arg2, 'mul')
+        value = []
+        node.mcn = tf_nodes.McnNode(node.name, value, 'mul', mcnIns) 
     elif isinstance(node, tf_nodes.TFBiasAdd):
         # while the bias add op is a generic operation, we perform
         # pattern matching here to check for the presence of a batch norm layer
@@ -263,27 +258,35 @@ def tf2mcn(node, depth):
 
         # ----------------------------------------------------------
         if not is_bn_layer:
-            print('not handled yet')
-            ipdb.set_trace()
 
-            arg1 = mcnIns[0]
-            arg2 = mcnIns[1]
-            node.mcn = (arg1, arg2, 'biasAdd')
+            # if batch norm is not used, then we merge the bias with
+            # the preceeding convolutional layer (if one exists)
+            for node in mcnIns:
+                if node.op == 'conv':
+                    conv_node = node
+                elif node.op == 'const':
+                    bias_node = node
+                else:
+                    raise NotImplementedError('no support for solo biases yet')
+
+            if 'conv_node' not in locals():
+                raise NotImplementedError('no support for solo biases yet')
+
+            conv_node.bias_term = bias_node.value
+            value = []
+            node.mcn = tf_nodes.McnNode(node.name, value, 'bias_add', mcnIns) 
         # ----------------------------------------------------------
+        else:
+            # construct matconvnet layer name
+            num_prev_convs = sum(['conv' in x for x in layerNames])
+            name = 'bn{}'.format(num_prev_convs)
 
-
-        #TODO(sam): Note this currently assumes the standard format
-        # of conv then BN, will need to make more general 
-
-        # construct matconvnet layer name
-        num_prev_convs = sum(['conv' in x for x in layerNames])
-        name = 'bn{}'.format(num_prev_convs)
-
-        # build layer
-        mcnLayer = tf_nodes.McnBatchNorm(name, node, mcnIns) 
-        layers.append(mcnLayer)
-        layerNames.append(name)
-        node.mcn = (mcnLayer, 'batchNorm')
+            # build layer
+            mcnLayer = tf_nodes.McnBatchNorm(name, node, mcnIns) 
+            layers.append(mcnLayer)
+            layerNames.append(name)
+            node.mcn = mcnLayer
+        # ----------------------------------------------------------
 
     elif isinstance(node, tf_nodes.TFMaximum):
         # similarly as above, the elementwise max is a generic operation, but 
@@ -348,21 +351,6 @@ def tf2mcn(node, depth):
         ipdb.set_trace()
     print('processed: {}'.format(node.name))
     return node
-
-    # if isinstance(node, tf_nodes.TFPlaceHolder):
-        # var = tf_nodes.McnInput(node.name)
-        # out = {'input', var}
-        # return out
-    # elif isinstance(node, tf_nodes.TFConst):
-        # param = tf_nodes.McnParam(node.name, node.value)
-        # out = {'param': param}
-        # return out
-    # elif isinstance(node, tf_nodes.TFConv2D):
-        # print('here')
-    # elif isinstance(node, tf_nodes.TFBiasAdd):
-        # print('here2')
-    # else:
-        # print('here3')
 
 depth = 0 
 tf2mcn(head, depth)

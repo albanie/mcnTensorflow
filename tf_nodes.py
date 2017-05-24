@@ -199,10 +199,11 @@ class TFGraph(object):
 # --------------------------------------------------------------------
 class McnNode(object):
 
-    def __init__(self, name, value, op):
+    def __init__(self, name, value, op, input_nodes=None):
         self.name = name 
         self.value = value
         self.op = op
+        self.input_nodes = input_nodes
 
 class McnLayer(object):
     def __init__(self, name, inputs, outputs):
@@ -239,13 +240,13 @@ class McnLayer(object):
         return mlayer
 
 class McnConv(McnLayer):
-    def __init__(self, name, tf_conv_node, node_inputs, dilation=[1,1]):
+    def __init__(self, name, tf_node, input_nodes, dilation=[1,1]):
 
         # parse the expression formed by input nodes
-        assert len(node_inputs) == 2, 'conv layer expects two nodes as inputs'
+        assert len(input_nodes) == 2, 'conv layer expects two nodes as inputs'
 
         # parse input nodes
-        for node in node_inputs:
+        for node in input_nodes:
             if node.op == 'pad':
                 padding_node = node
             elif node.op == 'const':
@@ -268,16 +269,17 @@ class McnConv(McnLayer):
 
         # reformat padding to match mcn
         tf_pad = padding_node.value
-        param_format = tf_conv_node.data_format
+        param_format = tf_node.data_format
         pad_top_bottom = tf_pad[param_format[0],:]
         pad_left_right = tf_pad[param_format[1],:]
         self.pad = np.hstack((pad_top_bottom, pad_left_right))
 
         # reformat stride to match mcn
-        stride_x = tf_conv_node.stride[param_format[0]]
-        stride_y = tf_conv_node.stride[param_format[1]]
+        stride_x = tf_node.stride[param_format[0]]
+        stride_y = tf_node.stride[param_format[1]]
         self.stride = np.hstack((stride_x, stride_y))
         self.op = 'conv'
+        self.input_nodes = input_nodes
 
         # check options are correctly formatted
         assert len(self.pad) == 4, ('padding format does hvae the '
@@ -310,172 +312,56 @@ class McnConv(McnLayer):
         print("  c- dilation: %s" % (self.dilation,))
         print("  c- group: %s" % (self.group,))
 
-    # def reshape(self, model):
-        # varin = model.vars[self.inputs[0]]
-        # varout = model.vars[self.outputs[0]]
-        # if not varin.shape: return
-        # varout.shape = getFilterOutputSize(varin.shape[0:2],
-                                           # self.kernel_size,
-                                           # self.stride,
-                                           # self.pad) \
-                                           # + [self.num_output, varin.shape[3]]
-        # self.filter_depth = varin.shape[2] / self.group
-
-    # def getTransforms(self, model):
-        # return [[getFilterTransform(self.kernel_size, self.stride, self.pad)]]
-
     def setParams(self, filters, data_format):
         # TODO(sam): implement
         ipdb.set_trace()
         model.params[self.params[i]].value = blob
         model.params[self.params[i]].shape = blob.shape
 
-class McnBatchNorm(McnLayer):
-
-    def __init__(self, name, tf_conv_node, node_inputs, eps=1e-5):
-    # def __init__(self, name, inputs, outputs, use_global_stats, moving_average_fraction, eps):
-        # parse the expression formed by input nodes
-        assert len(node_inputs) == 2, 'batch norm layer expects two nodes as inputs'
-
-        # parse inputs
-        bias_expr = node_inputs
-        self.bias_term = node_inputs[1].value
-
-        # parse gain expression
-        gain_expr = bias_expr[0]
-        assert gain_expr[2] == 'mul', 'bn expression does not multiply by gain'
-        self.scale_factor = gain_expr[1].value
-        
-        # parse var expression
-        var_expr = gain_expr[0]
-        assert var_expr[2] == 'div', 'bn expression does not divide by variance'
-        self.variance = var_expr[1].value
-
-        # parse mean expression
-        mean_expr = var_expr[0]
-        assert mean_expr[2] == 'sub', 'bn expression does not subtract the mean'
-        self.mean = mean_expr[1].value
-
-        # parse conv expression
-        conv_expr = mean_expr[0]
-        assert conv_expr[1] == 'conv', 'bn expression does not follow a convolution'
-        self.prev_conv = conv_expr[0]
-
-        # define input and output variable names
-        inputs = self.prev_conv.outputs
-        outputs = name
-
-        super().__init__(name, inputs, outputs)
-
-        self.eps = eps
-        self.params = [name + u'_mean',
-                       name + u'_variance',
-                       name + u'_scale_factor']
-
-    @staticmethod
-    def is_batch_norm_expression(tf_node, node_inputs):
-        """ 
-        in order to extract batch normalization layers from a tensor flow
-        computational graph, we need to be able to match against the set
-        of operations which constitute batch norm.  This method performs
-        that pattern matching
-        """
-        # parse inputs
-        expr = node_inputs[0]
-        bias = node_inputs[1]
-   
-        # check for required sequence of ops
-        is_bn = (expr[-1] == 'mul') and \
-                (expr[0][-1] == 'div') and \
-                (expr[0][0][-1] == 'sub')
-
-        #TODO(sam): add in more robust checks
-        return is_bn
-
-
-    def display(self):
-        super(CaffeBatchNorm, self).display()
-        print("  c- use_global_stats: %s" % (self.use_global_stats,))
-        print("  c- moving_average_fraction: %s" % (self.moving_average_fraction,))
-        print("  c- eps: %s" % (self.eps))
-
-    def setBlob(self, model, i, blob):
-        assert(i < 3)
-        model.params[self.params[i]].value = blob
-        model.params[self.params[i]].shape = blob.shape
-
-    def reshape(self, model):
-        shape = model.vars[self.inputs[0]].shape
-        mean = model.params[self.params[0]].value
-        variance = model.params[self.params[1]].value
-        scale_factor = model.params[self.params[2]].value
-        for i in range(3): del model.params[self.params[i]]
-        self.params = [self.name + u'_mult',
-                       self.name + u'_bias',
-                       self.name + u'_moments']
-
-        model.addParam(self.params[0])
-        model.addParam(self.params[1])
-        model.addParam(self.params[2])
-
-        if shape:
-            mult = np.ones((shape[2],),dtype='float32')
-            bias = np.zeros((shape[2],),dtype='float32')
-            model.params[self.params[0]].value = mult
-            model.params[self.params[0]].shape = mult.shape
-            model.params[self.params[1]].value = bias
-            model.params[self.params[1]].shape = bias.shape
-
-        if mean.size:
-            moments = np.concatenate(
-                (mean.reshape(-1,1) / scale_factor,
-                 np.sqrt(variance.reshape(-1,1) / scale_factor + self.eps)),
-                axis=1)
-            model.params[self.params[2]].value = moments
-            model.params[self.params[2]].shape = moments.shape
-
-        model.vars[self.outputs[0]].shape = shape
-
-    def toMatlab(self):
-        mlayer = super(CaffeBatchNorm, self).toMatlab()
-        mlayer['type'][0] = u'dagnn.BatchNorm'
-        mlayer['block'][0] = dictToMatlabStruct(
-            {'epsilon': self.eps})
-        return mlayer
-
 class McnReLU(McnLayer):
-    def __init__(self, name, tf_node, node_inputs):
-        assert len(node_inputs) == 2, 'relu layer expects two nodes as inputs'
+    def __init__(self, name, tf_node, input_nodes):
+        assert len(input_nodes) == 2, 'relu layer expects two nodes as inputs'
 
-        # parse inputs
-        leak_expr = node_inputs[0]
-        raw_expr = node_inputs[1]
+        # parse inputs
+        for node in input_nodes:
+            if node.op == 'mul':
+                mul_node = node
+            else:
+                raw_node = node
 
-        inputs = raw_expr[0].outputs
+        for node in mul_node.input_nodes:
+            if node.op == 'const':
+                leak_node = node
+            else:
+                other_node = node
+
+        inputs = raw_node.outputs
         outputs = name
 
         super().__init__(name, inputs, outputs)
 
         # check for leak
-        assert leak_expr[2] == 'mul', 'leak expression does not multiply by factor'
-        leak = leak_expr[0].value
-        self.leak = leak
+        self.leak = leak_node.value
         self.op = 'relu'
 
     @staticmethod
-    def is_leaky_relu_expression(tf_node, node_inputs):
+    def is_leaky_relu_expression(tf_node, input_nodes):
         """ 
         pattern match to check for leaky relu
         """
-        # parse inputs
-        x = node_inputs[1]
-        leak_expr = node_inputs[0]
+        # parse previous layer of inputs
+        for node in input_nodes:
+            if node.op == 'mul':
+                mul_node = node
+            else:
+                raw_node = node
+
+        # check that at least one node was a multiplier
+        if 'mul_node' not in locals(): 
+            return False
 
         #TODO(sam): add in more robust checks
-
-        # check for leaky relu inputs
-        match = (hash(leak_expr[0]) == hash(x)) or (hash(leak_expr[1]) == hash(x))
-        is_leaky_relu = (leak_expr[-1] == 'mul') and match
+        is_leaky_relu = id(raw_node) in [id(node) for node in mul_node.input_nodes]
         return is_leaky_relu
 
     def toMatlab(self):
@@ -485,10 +371,10 @@ class McnReLU(McnLayer):
         return mlayer
 
 class McnConcat(McnLayer):
-    def __init__(self, name, tf_node, node_inputs):
-        assert len(node_inputs) == 3, 'concat layer expects three nodes as inputs'
+    def __init__(self, name, tf_node, input_nodes):
+        assert len(input_nodes) == 3, 'concat layer expects three nodes as inputs'
 
-        inputs = [node.outputs for node in node_inputs[:2]]
+        inputs = [node.outputs for node in input_nodes[:2]]
         outputs = name
  
         super().__init__(name, inputs, outputs)
@@ -503,11 +389,11 @@ class McnConcat(McnLayer):
         return mlayer
 
 class McnExtractImagePatches(McnLayer):
-    def __init__(self, name, tf_node, node_inputs):
-        assert len(node_inputs) == 1, 'extract image patches layer expects one node as input'
+    def __init__(self, name, tf_node, input_nodes):
+        assert len(input_nodes) == 1, 'extract image patches layer expects one node as input'
 
         # parse inputs
-        src_node = node_inputs[0]
+        src_node = input_nodes[0]
         param_format = [1,2,3,0] # this is currently the form of the TF layer, but may change
 
         inputs = src_node.outputs
@@ -546,72 +432,93 @@ class McnExtractImagePatches(McnLayer):
 
 class McnBatchNorm(McnLayer):
 
-    def __init__(self, name, tf_node, node_inputs, eps=1e-5):
+    def __init__(self, name, tf_node, input_nodes, eps=1e-5):
         # parse the expression formed by input nodes
-        assert len(node_inputs) == 2, 'batch norm layer expects two nodes as inputs'
+        assert len(input_nodes) == 2, 'batch norm layer expects two nodes as inputs'
 
-        ipdb.set_trace()
+        # parse inputs
+        for node in input_nodes:
+            if node.op == 'const':
+                bias_node = node
+            elif node.op == 'mul':
+                mul_node = node
+
+        # parse inputs
+        for node in mul_node.input_nodes:
+            if node.op == 'const':
+                gain_node = node
+            elif node.op == 'div':
+                div_node = node
+
+        # parse inputs
+        for node in div_node.input_nodes:
+            if node.op == 'const':
+                var_node = node
+            elif node.op == 'sub':
+                sub_node = node
+
+        # parse inputs
+        for node in sub_node.input_nodes:
+            if node.op == 'const':
+                mean_node = node
+            elif node.op == 'conv':
+                conv_node = node
+
         # parse inputs
-        bias_expr = node_inputs
-        self.bias_term = node_inputs[1].value
-
-        # parse gain expression
-        gain_expr = bias_expr[0]
-        assert gain_expr[2] == 'mul', 'bn expression does not multiply by gain'
-        self.scale_factor = gain_expr[1].value
-        
-        # parse var expression
-        var_expr = gain_expr[0]
-        assert var_expr[2] == 'div', 'bn expression does not divide by variance'
-        self.variance = var_expr[1].value
-
-        # parse mean expression
-        mean_expr = var_expr[0]
-        assert mean_expr[2] == 'sub', 'bn expression does not subtract the mean'
-        self.mean = mean_expr[1].value
-
-        # parse conv expression
-        conv_expr = mean_expr[0]
-        assert conv_expr[1] == 'conv', 'bn expression does not follow a convolution'
-        self.prev_conv = conv_expr[0]
+        self.bias_term = bias_node.value
+        self.scale_factor = gain_node.value
+        self.variance = var_node.value
+        self.mean = mean_node.value
 
         # define input and output variable names
-        inputs = self.prev_conv.outputs
+        inputs = conv_node.outputs
         outputs = name
 
         super().__init__(name, inputs, outputs)
 
         self.eps = eps
+        self.op = 'batch_norm'
         self.params = [name + u'_mean',
                        name + u'_variance',
                        name + u'_scale_factor']
 
     @staticmethod
-    def is_batch_norm_expression(tf_node, node_inputs):
+    def is_batch_norm_expression(tf_node, input_nodes):
         """ 
         in order to extract batch normalization layers from a tensor flow
         computational graph, we need to be able to match against the set
         of operations which constitute batch norm.  This method performs
         that pattern matching
         """
+
         # parse inputs
-        expr = node_inputs[0]
-        bias = node_inputs[1]
-   
+        for node in input_nodes:
+            if node.op == 'const':
+                bias_node = node
+            elif node.op == 'mul':
+                mul_node = node
+            else:
+                return False # unexpected format from batch norm
+              
         # check for required sequence of ops
-        is_bn = (expr[-1] == 'mul') and \
-                (expr[0][-1] == 'div') and \
-                (expr[0][0][-1] == 'sub')
+        expected_div_ops = {'const', 'div'}
+        div_ops = set([node.op for node in mul_node.input_nodes])
+
+        # parse previous layer of inputs
+        for node in mul_node.input_nodes:
+            if node.op == 'const':
+                var_node = node
+            elif node.op == 'div':
+                div_node = node
+            else:
+                return False # unexpected format from batch norm
+
+        expected_sub_ops = {'const', 'sub'}
+        sub_ops = set([node.op for node in div_node.input_nodes])
+        is_bn = (sub_ops == expected_sub_ops) and (div_ops == expected_div_ops)
 
         #TODO(sam): add in more robust checks
         return is_bn
-
-
-    def display(self):
-        super(CaffeBatchNorm, self).display()
-        print("  c- use_global_stats: %s" % (self.use_global_stats,))
-        print("  c- moving_average_fraction: %s" % (self.moving_average_fraction,))
-        print("  c- eps: %s" % (self.eps))
 
     def setBlob(self, model, i, blob):
         assert(i < 3)
@@ -651,7 +558,7 @@ class McnBatchNorm(McnLayer):
         model.vars[self.outputs[0]].shape = shape
 
     def toMatlab(self):
-        mlayer = super(CaffeBatchNorm, self).toMatlab()
+        mlayer = super().toMatlab()
         mlayer['type'][0] = u'dagnn.BatchNorm'
         mlayer['block'][0] = dictToMatlabStruct(
             {'epsilon': self.eps})
@@ -659,12 +566,12 @@ class McnBatchNorm(McnLayer):
 
 class McnPooling(McnLayer):
 
-    def __init__(self, name, tf_node, node_inputs, method):
+    def __init__(self, name, tf_node, input_nodes, method):
 
-        assert len(node_inputs) == 1, 'pooling layer takes a single input node'
+        assert len(input_nodes) == 1, 'pooling layer takes a single input node'
 
         # parse inputs
-        pool_node = node_inputs[0]
+        pool_node = input_nodes[0]
 
         # reformat kernel size to match mcn
         tf_kernel_size = tf_node.ksize
