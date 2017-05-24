@@ -190,23 +190,20 @@ layers = []
 layerNames = [] # ensure unique names for each new layer
 
 def tf2mcn(node, depth):
-    # print('processing {}'.format(node.name))
-    # print('processing inputs {}'.format(node.inputs))
-    # print('current depth {}'.format(depth))
 
     # --------------------------------
     # Base cases - input node to graph
     # --------------------------------
     if not node.inputs:
         if isinstance(node, tf_nodes.TFPlaceHolder):
-            x = tf_nodes.McnInput(node.name)
             op = 'input'
+            value = []
         elif isinstance(node, tf_nodes.TFConst):
-            x = tf_nodes.McnParam(node.name, node.value)
             op = 'const'
+            value = node.value
         else:
             error('unrecognised input {}'.format(type(node)))
-        node.mcn = (x, [], op) # store mcn expression to indicated as visited
+        node.mcn = tf_nodes.McnNode(node.name, value, op) # store mcn node to indicated as visited
         return node
 
     # post-order traversal - gather expression inputs for binary ops
@@ -220,13 +217,13 @@ def tf2mcn(node, depth):
     if isinstance(node, tf_nodes.TFPad):
         assert len(mcnIns) == 2, 'padding op expects two inputs'
 
-        # check that the second input contains the padding
-        padIn = mcnIns[1]
-        assert(padIn[2] == 'const')
+        # check that the second input contains the padding as a constant
+        assert(mcnIns[1].op == 'const')
 
-        vname = mcnIns[0][0].name
-        pad = mcnIns[1][0].value
-        node.mcn = (vname, pad, 'pad')
+        # we want to keep the same variable name and store the padding
+        name = mcnIns[0].name
+        value = mcnIns[1].value
+        node.mcn = tf_nodes.McnNode(name, value, 'pad')
     elif isinstance(node, tf_nodes.TFConv2D):
 
         # construct matconvnet layer name
@@ -239,13 +236,16 @@ def tf2mcn(node, depth):
         layerNames.append(name)
 
         # store new layer as expression
-        node.mcn = (mcnLayer, 'conv')
+        node.mcn = mcnLayer
 
     elif isinstance(node, tf_nodes.TFSub):
         assert len(mcnIns) == 2, 'sub op expects two inputs'
+        ipdb.set_trace()
         arg1 = mcnIns[0]
         arg2 = mcnIns[1]
-        node.mcn = (arg1, arg2, 'sub')
+        value = []
+        input_names =  % here
+        node.mcn = tf_nodes.McnNode(node.name, value, 'sub') 
     elif isinstance(node, tf_nodes.TFRealDiv):
         assert len(mcnIns) == 2, 'realdiv op expects two inputs'
         arg1 = mcnIns[0]
@@ -307,7 +307,7 @@ def tf2mcn(node, depth):
         mcnLayer = tf_nodes.McnReLU(name, node, mcnIns) 
         layers.append(mcnLayer)
         layerNames.append(name)
-        node.mcn = (mcnLayer, 'relu')
+        node.mcn = mcnLayer
     elif isinstance(node, tf_nodes.TFMaxPool):
         # construct matconvnet layer name
         num_prev_pools = sum(['pool' in x for x in layerNames])
@@ -319,7 +319,31 @@ def tf2mcn(node, depth):
         layerNames.append(name)
 
         # store new layer as expression
-        node.mcn = (mcnLayer, 'pool')
+        node.mcn = mcnLayer
+    elif isinstance(node, tf_nodes.TFIdentity):
+        op = 'identity'
+        value = []
+        name = mcnIns[0].name
+        node.mcn = tf_nodes.McnNode(name, value, op) 
+    elif isinstance(node, tf_nodes.TFExtractImagePatches):
+        # construct matconvnet layer name
+        num_prev_patches = sum(['patches' in x for x in layerNames])
+        name = 'patches{}'.format(num_prev_patches + 1)
+
+        # build layer
+        mcnLayer = tf_nodes.McnExtractImagePatches(name, node, mcnIns) 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+        node.mcn = mcnLayer
+    elif isinstance(node, tf_nodes.TFConcatV2):
+        # construct matconvnet layer name
+        num_prev_concat = sum(['concat' in x for x in layerNames])
+        name = 'concat{}'.format(num_prev_concat + 1)
+
+        mcnLayer = tf_nodes.McnConcat(name, node, mcnIns) 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+        node.mcn = mcnLayer
     else:
         ipdb.set_trace()
     print('processed: {}'.format(node.name))
@@ -341,7 +365,7 @@ def tf2mcn(node, depth):
         # print('here3')
 
 depth = 0 
-graph2layers(head, depth)
+tf2mcn(head, depth)
 
 # --------------------------------------------------------------------
 #                                            extract meta information

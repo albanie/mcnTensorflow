@@ -80,9 +80,6 @@ class TFIdentity(TFNode):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def toMatlab(self):
-        return None
-
     def __repr__(self):
         return super().summary_str('Identity')
 
@@ -92,7 +89,6 @@ class TFNoOp(TFNode):
 
     def __repr__(self):
         return super().summary_str('NoOp')
-
 
 class TFConst(TFNode):
     def __init__(self, name, input_names, input_types, shape, value):
@@ -206,7 +202,7 @@ class McnNode(object):
     def __init__(self, name, value, op):
         self.name = name 
         self.value = value
-        self.op = None
+        self.op = op
 
 class McnLayer(object):
     def __init__(self, name, inputs, outputs):
@@ -248,25 +244,30 @@ class McnConv(McnLayer):
         # parse the expression formed by input nodes
         assert len(node_inputs) == 2, 'conv layer expects two nodes as inputs'
 
-        # parse inputs
-        padding_expr = node_inputs[0]
-        filters = node_inputs[1]
+        # parse input nodes
+        for node in node_inputs:
+            if node.op == 'pad':
+                padding_node = node
+            elif node.op == 'const':
+                filter_node = node
+            else:
+                raise ValueError('unexpected input op {}'.format(node.op))
 
         # define input and output variable names
-        inputs = padding_expr[0]
+        inputs = padding_node.name
         outputs = name
 
         super().__init__(name, inputs, outputs)
 
         # determine filter dimensions
-        self.kernel_size = filters.value.shape[:2]
-        self.num_out = filters.value.shape[3]
+        self.kernel_size = filter_node.value.shape[:2]
+        self.num_out = filter_node.value.shape[3]
 
         # a bias is often not used in conjuction with batch norm
         self.bias_term = 0 
 
         # reformat padding to match mcn
-        tf_pad = padding_expr[1]
+        tf_pad = padding_node.value
         param_format = tf_conv_node.data_format
         pad_top_bottom = tf_pad[param_format[0],:]
         pad_left_right = tf_pad[param_format[1],:]
@@ -276,6 +277,7 @@ class McnConv(McnLayer):
         stride_x = tf_conv_node.stride[param_format[0]]
         stride_y = tf_conv_node.stride[param_format[1]]
         self.stride = np.hstack((stride_x, stride_y))
+        self.op = 'conv'
 
         # check options are correctly formatted
         assert len(self.pad) == 4, ('padding format does hvae the '
@@ -294,8 +296,8 @@ class McnConv(McnLayer):
         # have been constructed
         self.params = [name + '_filter']
         if self.bias_term: self.params.append(name + '_bias')
-        self.filters = filters
-        self.filter_depth = None # this is set dynamically
+        self.filters = filter_node.value
+        self.filter_depth = filter_node.value.shape[3]
 
     def display(self):
         super().display()
@@ -328,45 +330,6 @@ class McnConv(McnLayer):
         model.params[self.params[i]].value = blob
         model.params[self.params[i]].shape = blob.shape
 
-    # def transpose(self, model):
-        # self.kernel_size = reorder(self.kernel_size, [1,0])
-        # self.stride = reorder(self.stride, [1,0])
-        # self.pad = reorder(self.pad, [2,3,0,1])
-        # self.dilation = reorder(self.dilation, [1,0])
-        # if model.params[self.params[0]].hasValue():
-            # print "Layer %s: transposing filters" % self.name
-            # param = model.params[self.params[0]]
-            # param.value = param.value.transpose([1,0,2,3])
-            # if model.vars[self.inputs[0]].bgrInput:
-                # print "Layer %s: BGR to RGB conversion" % self.name
-                # param.value = param.value[:,:,: : -1,:]
-
-    # def toMatlab(self):
-        # size = self.kernel_size + [self.filter_depth, self.num_output]
-        # mlayer = super(CaffeConv, self).toMatlab()
-        # mlayer['type'][0] = u'dagnn.Conv'
-        # mlayer['block'][0] = dictToMatlabStruct(
-            # {'hasBias': self.bias_term,
-             # 'size': row(size),
-             # 'pad': row(self.pad),
-             # 'stride': row(self.stride),
-             # 'dilate': row(self.dilation)})
-        # return mlayer
-
-    # def toMatlabSimpleNN(self):
-        # size = self.kernel_size + [self.filter_depth, self.num_output]
-        # mlayer = super(CaffeConv, self).toMatlabSimpleNN()
-        # mlayer['type'] = u'conv'
-        # mlayer['weights'] = np.empty([1,len(self.params)], dtype=np.object)
-        # mlayer['size'] = row(size)
-        # mlayer['pad'] = row(self.pad)
-        # mlayer['stride'] = row(self.stride)
-        # mlayer['dilate'] = row(self.dilation)
-        # for p, name in enumerate(self.params):
-            # mlayer['weights'][0,p] = self.model.params[name].toMatlabSimpleNN()
-        # return mlayer
-
-
 class McnBatchNorm(McnLayer):
 
     def __init__(self, name, tf_conv_node, node_inputs, eps=1e-5):
@@ -480,18 +443,6 @@ class McnBatchNorm(McnLayer):
             {'epsilon': self.eps})
         return mlayer
 
-# class McnRelu(McnLayer):
-    # def __init__(self, name, tf_conv_node, node_inputs):
-        # super().__init__(name, inputs, outputs)
-
-    # def toMatlab(self):
-        # mlayer = super(CaffeReLU, self).toMatlab()
-        # mlayer['type'][0] = u'dagnn.ReLU'
-        # mlayer['block'][0] = dictToMatlabStruct(
-            # {'leak': float(0.0) })
-        # # todo: leak factor
-        # return mlayer
-
 class McnReLU(McnLayer):
     def __init__(self, name, tf_node, node_inputs):
         assert len(node_inputs) == 2, 'relu layer expects two nodes as inputs'
@@ -509,6 +460,7 @@ class McnReLU(McnLayer):
         assert leak_expr[2] == 'mul', 'leak expression does not multiply by factor'
         leak = leak_expr[0].value
         self.leak = leak
+        self.op = 'relu'
 
     @staticmethod
     def is_leaky_relu_expression(tf_node, node_inputs):
@@ -532,13 +484,73 @@ class McnReLU(McnLayer):
         mlayer['block'][0] = dictToMatlabStruct({'leak': self.leak })
         return mlayer
 
+class McnConcat(McnLayer):
+    def __init__(self, name, tf_node, node_inputs):
+        assert len(node_inputs) == 3, 'concat layer expects three nodes as inputs'
+
+        inputs = [node.outputs for node in node_inputs[:2]]
+        outputs = name
+ 
+        super().__init__(name, inputs, outputs)
+
+        self.axis = tf_node.axis
+        self.op = 'concat'
+
+    def toMatlab(self):
+        mlayer = super().toMatlab()
+        mlayer['type'][0] = u'dagnn.Concat'
+        mlayer['block'][0] = dictToMatlabStruct({'dim': float(self.axis) + 1})
+        return mlayer
+
+class McnExtractImagePatches(McnLayer):
+    def __init__(self, name, tf_node, node_inputs):
+        assert len(node_inputs) == 1, 'extract image patches layer expects one node as input'
+
+        # parse inputs
+        src_node = node_inputs[0]
+        param_format = [1,2,3,0] # this is currently the form of the TF layer, but may change
+
+        inputs = src_node.outputs
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        # reformat kernel size to match mcn
+        tf_stride = tf_node.stride
+        stride_y = tf_stride[param_format[0]]
+        stride_x = tf_stride[param_format[1]]
+        self.stride = np.hstack((stride_y, stride_x))
+
+        # reformat kernel size to match mcn
+        tf_rate = tf_node.rate
+        rate_y = tf_rate[param_format[0]]
+        rate_x = tf_rate[param_format[1]]
+        self.rate = np.hstack((rate_y, rate_x))
+
+        #TODO(sam) fix properly on the first pass
+        self.pad = [1, 1, 1, 1]
+        self.pad_type = tf_node.pad_type
+
+    def toMatlab(self):
+        mlayer = super().toMatlab()
+        mlayer['type'][0] = u'dagnn.ExtractImagePatches'
+        mlayer['block'][0] = dictToMatlabStruct(
+            {'stride': row(self.stride),
+             'rate': row(self.rate),
+             'pad': row(self.pad)})
+        if not self.pad_corrected:
+            print(('Warning: pad correction for layer {} could not be ',
+                 ('computed because the layer input shape could not be ', 
+                  'determined').format(self.name)))
+        return mlayer
+
 class McnBatchNorm(McnLayer):
 
-    def __init__(self, name, tf_conv_node, node_inputs, eps=1e-5):
-    # def __init__(self, name, inputs, outputs, use_global_stats, moving_average_fraction, eps):
+    def __init__(self, name, tf_node, node_inputs, eps=1e-5):
         # parse the expression formed by input nodes
         assert len(node_inputs) == 2, 'batch norm layer expects two nodes as inputs'
 
+        ipdb.set_trace()
         # parse inputs
         bias_expr = node_inputs
         self.bias_term = node_inputs[1].value
@@ -645,20 +657,14 @@ class McnBatchNorm(McnLayer):
             {'epsilon': self.eps})
         return mlayer
 
-    def toMatlabSimpleNN(self):
-        mlayer = super(CaffeBatchNorm, self).toMatlabSimpleNN()
-        mlayer['type'] = u'bnorm'
-        mlayer['epsilon'] = self.eps
-        return mlayer
-
 class McnPooling(McnLayer):
 
     def __init__(self, name, tf_node, node_inputs, method):
 
+        assert len(node_inputs) == 1, 'pooling layer takes a single input node'
 
         # parse inputs
-        pool_expr = node_inputs
-        assert len(pool_expr) == 1, 'pooling layer takes a single input node'
+        pool_node = node_inputs[0]
 
         # reformat kernel size to match mcn
         tf_kernel_size = tf_node.ksize
@@ -668,7 +674,7 @@ class McnPooling(McnLayer):
         self.kernel_size = np.hstack((kernel_size_y, kernel_size_x))
 
         # reformat kernel size to match mcn
-        tf_stride = tf_node.ksize
+        tf_stride = tf_node.stride
         param_format = tf_node.data_format
         stride_y = tf_stride[param_format[0]]
         stride_x = tf_stride[param_format[1]]
@@ -678,12 +684,13 @@ class McnPooling(McnLayer):
         self.pad = [1, 1, 1, 1]
 
         # define input and output variable names
-        inputs = pool_expr[0][0].outputs
+        inputs = pool_node.outputs
         outputs = name
 
         super().__init__(name, inputs, outputs)
 
         self.method = method
+        self.op = 'pool'
 
     def display(self):
         super(CaffePooling, self).display()
