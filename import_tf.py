@@ -11,6 +11,7 @@ import scipy.misc
 import google.protobuf.text_format
 import ipdb
 import tensorflow as tf
+from pathlib import Path
 import json
 from tensorflow.python.lib.io import file_io
 from tensorflow.core.framework import graph_pb2
@@ -32,7 +33,7 @@ tf2np_dtype = {
 # convert data format enumerations into a canonical array ordering
 # matching the mcn convention of (H,W,C,N)
 tf2mcn_order = {
-    'NHWC': [3,0,1,2], 
+    'NHWC': [1,2,3,0], 
 }
 
 # --------------------------------------------------------------------
@@ -40,18 +41,19 @@ tf2mcn_order = {
 # --------------------------------------------------------------------
 
 # Unlike caffe, Tensorflow stores the network structure in a single file
-path = '/users/albanie/coding/libs/darkflow/built_graph/yolo-voc-v2.pb'
-meta_path = '/users/albanie/coding/libs/darkflow/built_graph/yolo-voc-v2.meta'
+base = Path.home() / 'coding/libs/darkflow/built_graph'
+path = base / 'yolo-voc-v2.pb'
+meta_path = base / 'yolo-voc-v2.meta'
 
 # import the graph definition from TF
 graph_def = graph_pb2.GraphDef() 
 
 # parse the data
-with open(path, "rb") as f:
+with open(str(path), "rb") as f:
   graph_def.ParseFromString(f.read())
 
 # parse the meta info as json, since the protobuf appears to have issues
-meta_raw = file_io.FileIO(meta_path, "rb").read().decode('utf-8')
+meta_raw = file_io.FileIO(str(meta_path), "rb").read().decode('utf-8')
 meta = json.loads(meta_raw)
 
 # --------------------------------------------------------------------
@@ -187,7 +189,7 @@ head = tf_graph.nodes[node_names.index('output')]
 layers = []
 layerNames = [] # ensure unique names for each new layer
 
-def graph2layers(node, depth):
+def tf2mcn(node, depth):
     # print('processing {}'.format(node.name))
     # print('processing inputs {}'.format(node.inputs))
     # print('current depth {}'.format(depth))
@@ -198,43 +200,46 @@ def graph2layers(node, depth):
     if not node.inputs:
         if isinstance(node, tf_nodes.TFPlaceHolder):
             x = tf_nodes.McnInput(node.name)
+            op = 'input'
         elif isinstance(node, tf_nodes.TFConst):
             x = tf_nodes.McnParam(node.name, node.value)
+            op = 'const'
         else:
             error('unrecognised input {}'.format(type(node)))
-        node.mcn = x # store mcn expression to indicated as visited
+        node.mcn = (x, [], op) # store mcn expression to indicated as visited
         return node
 
     # post-order traversal - gather expression inputs for binary ops
     mcnIns = []
     for in_node in node.inputs:
         if not hasattr(in_node, 'mcn'):
-            in_node = graph2layers(in_node, depth+1)
+            in_node = tf2mcn(in_node, depth+1)
         mcnIns.append(in_node.mcn)
-
 
     # resolve binary ops
     if isinstance(node, tf_nodes.TFPad):
         assert len(mcnIns) == 2, 'padding op expects two inputs'
-        vname = mcnIns[0].name
-        pad = mcnIns[1].value
+
+        # check that the second input contains the padding
+        padIn = mcnIns[1]
+        assert(padIn[2] == 'const')
+
+        vname = mcnIns[0][0].name
+        pad = mcnIns[1][0].value
         node.mcn = (vname, pad, 'pad')
     elif isinstance(node, tf_nodes.TFConv2D):
-        assert len(mcnIns) == 2, 'conv op expects two inputs'
 
-        # construct matconvnet Conv object
-        pad = paddedIn[1]
-        filters = mcnIns[1]
-        paddedIn = mcnIns[0]
-        layerInputs = paddedIn[0]
-
-        # HERE! 
+        # construct matconvnet layer name
         num_prev_convs = sum(['conv' in x for x in layerNames])
         name = 'conv{}'.format(num_prev_convs + 1)
-        mcnLayer = tf_nodes.McnConv(name, layerInputs, layerOutputs, bias, 
-                     pad, kernel_size, stride, dilation)
-        node.mcn = (paddedIn, node.stride, filters, 'conv')
-        ipdb.set_trace()
+
+        # build layer
+        mcnLayer = tf_nodes.McnConv(name, node, mcnIns) 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+
+        # store new layer as expression
+        node.mcn = (mcnLayer, 'conv')
 
     elif isinstance(node, tf_nodes.TFSub):
         assert len(mcnIns) == 2, 'sub op expects two inputs'
@@ -252,12 +257,72 @@ def graph2layers(node, depth):
         arg2 = mcnIns[1]
         node.mcn = (arg1, arg2, 'mul')
     elif isinstance(node, tf_nodes.TFBiasAdd):
-        assert len(mcnIns) == 2, 'bias add op expects two inputs'
-        arg1 = mcnIns[0]
-        arg2 = mcnIns[1]
-        node.mcn = (arg1, arg2, 'biasAdd')
+        # while the bias add op is a generic operation, we perform
+        # pattern matching here to check for the presence of a batch norm layer
+        is_bn_layer = McnBatchNorm.is_batch_norm_expression(node, mcnIns)
+
+        # ----------------------------------------------------------
+        if not is_bn_layer:
+            print('not handled yet')
+            ipdb.set_trace()
+
+            arg1 = mcnIns[0]
+            arg2 = mcnIns[1]
+            node.mcn = (arg1, arg2, 'biasAdd')
+        # ----------------------------------------------------------
+
+
+        #TODO(sam): Note this currently assumes the standard format
+        # of conv then BN, will need to make more general 
+
+        # construct matconvnet layer name
+        num_prev_convs = sum(['conv' in x for x in layerNames])
+        name = 'bn{}'.format(num_prev_convs)
+
+        # build layer
+        mcnLayer = tf_nodes.McnBatchNorm(name, node, mcnIns) 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+        node.mcn = (mcnLayer, 'batchNorm')
+
+    elif isinstance(node, tf_nodes.TFMaximum):
+        # similarly as above, the elementwise max is a generic operation, but 
+        # we perform pattern matching here to check for the presence of a relu
+        is_leaky_relu_layer = McnReLU.is_leaky_relu_expression(node, mcnIns)
+
+        # ----------------------------------------------------------
+        if not is_leaky_relu_layer:
+            print('not handled yet')
+            ipdb.set_trace()
+
+            arg1 = mcnIns[0]
+            arg2 = mcnIns[1]
+            node.mcn = (arg1, arg2, 'max')
+        # ----------------------------------------------------------
+        # construct matconvnet layer name
+        num_prev_convs = sum(['conv' in x for x in layerNames])
+        name = 'relu{}'.format(num_prev_convs)
+
+        # build layer
+        mcnLayer = tf_nodes.McnReLU(name, node, mcnIns) 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+        node.mcn = (mcnLayer, 'relu')
+    elif isinstance(node, tf_nodes.TFMaxPool):
+        # construct matconvnet layer name
+        num_prev_pools = sum(['pool' in x for x in layerNames])
+        name = 'pool{}'.format(num_prev_pools + 1)
+
+        # build layer
+        mcnLayer = tf_nodes.McnPooling(name, node, mcnIns, 'max') 
+        layers.append(mcnLayer)
+        layerNames.append(name)
+
+        # store new layer as expression
+        node.mcn = (mcnLayer, 'pool')
     else:
         ipdb.set_trace()
+    print('processed: {}'.format(node.name))
     return node
 
     # if isinstance(node, tf_nodes.TFPlaceHolder):

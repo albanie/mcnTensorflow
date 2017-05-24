@@ -144,8 +144,8 @@ class TFMaxPool(TFNode):
         + ksize : {}
         + pad_type : {}
         + data_format : {}"""
-        return summary.format(common, self.stride, self.pad_type, 
-                                    self.ksize, self.data_format)
+        return summary.format(common, self.stride, self.ksize, self.pad_type, 
+                                                             self.data_format)
 
 class TFConv2D(TFNode):
     def __init__(self, name, input_names, stride, pad_type, input_types, 
@@ -201,17 +201,12 @@ class TFGraph(object):
 # --------------------------------------------------------------------
 #                                                   Matconvnet objects
 # --------------------------------------------------------------------
+class McnNode(object):
 
-class McnParam(object):
-
-    def __init__(self, name, value):
+    def __init__(self, name, value, op):
         self.name = name 
         self.value = value
-
-class McnInput(object):
-
-    def __init__(self, name):
-        self.name = name 
+        self.op = None
 
 class McnLayer(object):
     def __init__(self, name, inputs, outputs):
@@ -224,27 +219,18 @@ class McnLayer(object):
     def reshape(self, model):
         pass
 
-    # def display(self):
-        # print "Layer \'{}\'".format(self.name)
-        # print "  +- type: %s" % (self.__class__.__name__)
-        # print "  +- inputs: %s" % (self.inputs,)
-        # print "  +- outputs: %s" % (self.outputs,)
-        # print "  +- params: %s" % (self.params,)
-
-    # def getTransforms(self, model):
-        # transforms = []
-        # for i in enumerate(self.inputs):
-            # row = []
-            # for j in enumerate(self.outputs):
-                # row.append(CaffeTransform([1.,1.], [1.,1.], [1.,1.]))
-            # transforms.append(row)
-        # return transforms
-
     def transpose(self, model):
         raise NotImplementedError
 
     def setBlob(self, model, i, blob):
         raise NotImplementedError
+
+    def display(self):
+        print('Layer \'{}\''.format(self.name))
+        print('  +- type: {}'.format(self.__class__.__name__))
+        print('  +- inputs: {}'.format(self.inputs,))
+        print('  +- outputs: %s'.format(self.outputs,))
+        print('  +- params: %s'.format(self.params,))
 
     def toMatlab(self):
         mlayer = np.empty(shape=[1,],dtype=mlayerdt)
@@ -257,45 +243,70 @@ class McnLayer(object):
         return mlayer
 
 class McnConv(McnLayer):
-    def __init__(self, name, inputs, outputs,
-                 num_output,
-                 bias_term,
-                 pad,
-                 kernel_size,
-                 stride,
-                 dilation,
-                 group):
+    def __init__(self, name, tf_conv_node, node_inputs, dilation=[1,1]):
 
-        super(CaffeConv, self).__init__(name, inputs, outputs)
+        # parse the expression formed by input nodes
+        assert len(node_inputs) == 2, 'conv layer expects two nodes as inputs'
 
-        if len(kernel_size) == 1 : kernel_size = kernel_size * 2
-        if len(stride) == 1 : stride = stride * 2
-        if len(dilation) == 1 : dilation = dilation * 2
-        if len(pad) == 1 : pad = pad * 4
-        elif len(pad) == 2 : pad = [pad[0], pad[0], pad[1], pad[1]]
+        # parse inputs
+        padding_expr = node_inputs[0]
+        filters = node_inputs[1]
 
-        self.num_output = num_output
-        self.bias_term = bias_term
-        self.pad = pad
-        self.kernel_size = kernel_size
-        self.stride = stride
+        # define input and output variable names
+        inputs = padding_expr[0]
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        # determine filter dimensions
+        self.kernel_size = filters.value.shape[:2]
+        self.num_out = filters.value.shape[3]
+
+        # a bias is often not used in conjuction with batch norm
+        self.bias_term = 0 
+
+        # reformat padding to match mcn
+        tf_pad = padding_expr[1]
+        param_format = tf_conv_node.data_format
+        pad_top_bottom = tf_pad[param_format[0],:]
+        pad_left_right = tf_pad[param_format[1],:]
+        self.pad = np.hstack((pad_top_bottom, pad_left_right))
+
+        # reformat stride to match mcn
+        stride_x = tf_conv_node.stride[param_format[0]]
+        stride_y = tf_conv_node.stride[param_format[1]]
+        self.stride = np.hstack((stride_x, stride_y))
+
+        # check options are correctly formatted
+        assert len(self.pad) == 4, ('padding format does hvae the '
+         'required number of elements for `[top bottom left right]`')
+        assert len(self.stride) == 2, ('stride format does hvae the '
+         'expected number of elements for `[strideY strideX]`')
+        assert len(self.kernel_size) == 2, ('kernel size should contain '
+          'exactly two elements')
+
+        # set dilation 
+        # TODO(sam) - handle dilated convs properly
         self.dilation = dilation
-        self.group = group
 
+        # set param names and store weights on the layer - note that
+        # params are not set on the shared model until all the layers
+        # have been constructed
         self.params = [name + '_filter']
-        if bias_term: self.params.append(name + '_bias')
-        self.filter_depth = None
+        if self.bias_term: self.params.append(name + '_bias')
+        self.filters = filters
+        self.filter_depth = None # this is set dynamically
 
-    # def display(self):
-        # super(CaffeConv, self).display()
-        # print "  +- filter dimension:", self.filter_depth
-        # print "  c- num_output (num filters): %s" % self.num_output
-        # print "  c- bias_term: %s" % self.bias_term
-        # print "  c- pad: %s" % (self.pad,)
-        # print "  c- kernel_size: %s" % self.kernel_size
-        # print "  c- stride: %s" % (self.stride,)
-        # print "  c- dilation: %s" % (self.dilation,)
-        # print "  c- group: %s" % (self.group,)
+    def display(self):
+        super().display()
+        print("  +- filter dimension:", self.filter_depth)
+        print("  c- num_output (num filters): %s" % self.num_output)
+        print("  c- bias_term: %s" % self.bias_term)
+        print("  c- pad: %s" % (self.pad,))
+        print("  c- kernel_size: %s" % self.kernel_size)
+        print("  c- stride: %s" % (self.stride,))
+        print("  c- dilation: %s" % (self.dilation,))
+        print("  c- group: %s" % (self.group,))
 
     # def reshape(self, model):
         # varin = model.vars[self.inputs[0]]
@@ -311,17 +322,11 @@ class McnConv(McnLayer):
     # def getTransforms(self, model):
         # return [[getFilterTransform(self.kernel_size, self.stride, self.pad)]]
 
-    # def setBlob(self, model, i, blob):
-        # assert(i < 2)
-        # if i == 0:
-            # assert(blob.shape[0] == self.kernel_size[0])
-            # assert(blob.shape[1] == self.kernel_size[1])
-            # assert(blob.shape[3] == self.num_output)
-            # self.filter_depth = blob.shape[2]
-        # elif i == 1:
-            # assert(blob.shape[0] == self.num_output)
-        # model.params[self.params[i]].value = blob
-        # model.params[self.params[i]].shape = blob.shape
+    def setParams(self, filters, data_format):
+        # TODO(sam): implement
+        ipdb.set_trace()
+        model.params[self.params[i]].value = blob
+        model.params[self.params[i]].shape = blob.shape
 
     # def transpose(self, model):
         # self.kernel_size = reorder(self.kernel_size, [1,0])
@@ -361,3 +366,368 @@ class McnConv(McnLayer):
             # mlayer['weights'][0,p] = self.model.params[name].toMatlabSimpleNN()
         # return mlayer
 
+
+class McnBatchNorm(McnLayer):
+
+    def __init__(self, name, tf_conv_node, node_inputs, eps=1e-5):
+    # def __init__(self, name, inputs, outputs, use_global_stats, moving_average_fraction, eps):
+        # parse the expression formed by input nodes
+        assert len(node_inputs) == 2, 'batch norm layer expects two nodes as inputs'
+
+        # parse inputs
+        bias_expr = node_inputs
+        self.bias_term = node_inputs[1].value
+
+        # parse gain expression
+        gain_expr = bias_expr[0]
+        assert gain_expr[2] == 'mul', 'bn expression does not multiply by gain'
+        self.scale_factor = gain_expr[1].value
+        
+        # parse var expression
+        var_expr = gain_expr[0]
+        assert var_expr[2] == 'div', 'bn expression does not divide by variance'
+        self.variance = var_expr[1].value
+
+        # parse mean expression
+        mean_expr = var_expr[0]
+        assert mean_expr[2] == 'sub', 'bn expression does not subtract the mean'
+        self.mean = mean_expr[1].value
+
+        # parse conv expression
+        conv_expr = mean_expr[0]
+        assert conv_expr[1] == 'conv', 'bn expression does not follow a convolution'
+        self.prev_conv = conv_expr[0]
+
+        # define input and output variable names
+        inputs = self.prev_conv.outputs
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        self.eps = eps
+        self.params = [name + u'_mean',
+                       name + u'_variance',
+                       name + u'_scale_factor']
+
+    @staticmethod
+    def is_batch_norm_expression(tf_node, node_inputs):
+        """ 
+        in order to extract batch normalization layers from a tensor flow
+        computational graph, we need to be able to match against the set
+        of operations which constitute batch norm.  This method performs
+        that pattern matching
+        """
+        # parse inputs
+        expr = node_inputs[0]
+        bias = node_inputs[1]
+   
+        # check for required sequence of ops
+        is_bn = (expr[-1] == 'mul') and \
+                (expr[0][-1] == 'div') and \
+                (expr[0][0][-1] == 'sub')
+
+        #TODO(sam): add in more robust checks
+        return is_bn
+
+
+    def display(self):
+        super(CaffeBatchNorm, self).display()
+        print("  c- use_global_stats: %s" % (self.use_global_stats,))
+        print("  c- moving_average_fraction: %s" % (self.moving_average_fraction,))
+        print("  c- eps: %s" % (self.eps))
+
+    def setBlob(self, model, i, blob):
+        assert(i < 3)
+        model.params[self.params[i]].value = blob
+        model.params[self.params[i]].shape = blob.shape
+
+    def reshape(self, model):
+        shape = model.vars[self.inputs[0]].shape
+        mean = model.params[self.params[0]].value
+        variance = model.params[self.params[1]].value
+        scale_factor = model.params[self.params[2]].value
+        for i in range(3): del model.params[self.params[i]]
+        self.params = [self.name + u'_mult',
+                       self.name + u'_bias',
+                       self.name + u'_moments']
+
+        model.addParam(self.params[0])
+        model.addParam(self.params[1])
+        model.addParam(self.params[2])
+
+        if shape:
+            mult = np.ones((shape[2],),dtype='float32')
+            bias = np.zeros((shape[2],),dtype='float32')
+            model.params[self.params[0]].value = mult
+            model.params[self.params[0]].shape = mult.shape
+            model.params[self.params[1]].value = bias
+            model.params[self.params[1]].shape = bias.shape
+
+        if mean.size:
+            moments = np.concatenate(
+                (mean.reshape(-1,1) / scale_factor,
+                 np.sqrt(variance.reshape(-1,1) / scale_factor + self.eps)),
+                axis=1)
+            model.params[self.params[2]].value = moments
+            model.params[self.params[2]].shape = moments.shape
+
+        model.vars[self.outputs[0]].shape = shape
+
+    def toMatlab(self):
+        mlayer = super(CaffeBatchNorm, self).toMatlab()
+        mlayer['type'][0] = u'dagnn.BatchNorm'
+        mlayer['block'][0] = dictToMatlabStruct(
+            {'epsilon': self.eps})
+        return mlayer
+
+# class McnRelu(McnLayer):
+    # def __init__(self, name, tf_conv_node, node_inputs):
+        # super().__init__(name, inputs, outputs)
+
+    # def toMatlab(self):
+        # mlayer = super(CaffeReLU, self).toMatlab()
+        # mlayer['type'][0] = u'dagnn.ReLU'
+        # mlayer['block'][0] = dictToMatlabStruct(
+            # {'leak': float(0.0) })
+        # # todo: leak factor
+        # return mlayer
+
+class McnReLU(McnLayer):
+    def __init__(self, name, tf_node, node_inputs):
+        assert len(node_inputs) == 2, 'relu layer expects two nodes as inputs'
+
+        # parse inputs
+        leak_expr = node_inputs[0]
+        raw_expr = node_inputs[1]
+
+        inputs = raw_expr[0].outputs
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        # check for leak
+        assert leak_expr[2] == 'mul', 'leak expression does not multiply by factor'
+        leak = leak_expr[0].value
+        self.leak = leak
+
+    @staticmethod
+    def is_leaky_relu_expression(tf_node, node_inputs):
+        """ 
+        pattern match to check for leaky relu
+        """
+        # parse inputs
+        x = node_inputs[1]
+        leak_expr = node_inputs[0]
+
+        #TODO(sam): add in more robust checks
+
+        # check for leaky relu inputs
+        match = (hash(leak_expr[0]) == hash(x)) or (hash(leak_expr[1]) == hash(x))
+        is_leaky_relu = (leak_expr[-1] == 'mul') and match
+        return is_leaky_relu
+
+    def toMatlab(self):
+        mlayer = super().toMatlab()
+        mlayer['type'][0] = u'dagnn.ReLU'
+        mlayer['block'][0] = dictToMatlabStruct({'leak': self.leak })
+        return mlayer
+
+class McnBatchNorm(McnLayer):
+
+    def __init__(self, name, tf_conv_node, node_inputs, eps=1e-5):
+    # def __init__(self, name, inputs, outputs, use_global_stats, moving_average_fraction, eps):
+        # parse the expression formed by input nodes
+        assert len(node_inputs) == 2, 'batch norm layer expects two nodes as inputs'
+
+        # parse inputs
+        bias_expr = node_inputs
+        self.bias_term = node_inputs[1].value
+
+        # parse gain expression
+        gain_expr = bias_expr[0]
+        assert gain_expr[2] == 'mul', 'bn expression does not multiply by gain'
+        self.scale_factor = gain_expr[1].value
+        
+        # parse var expression
+        var_expr = gain_expr[0]
+        assert var_expr[2] == 'div', 'bn expression does not divide by variance'
+        self.variance = var_expr[1].value
+
+        # parse mean expression
+        mean_expr = var_expr[0]
+        assert mean_expr[2] == 'sub', 'bn expression does not subtract the mean'
+        self.mean = mean_expr[1].value
+
+        # parse conv expression
+        conv_expr = mean_expr[0]
+        assert conv_expr[1] == 'conv', 'bn expression does not follow a convolution'
+        self.prev_conv = conv_expr[0]
+
+        # define input and output variable names
+        inputs = self.prev_conv.outputs
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        self.eps = eps
+        self.params = [name + u'_mean',
+                       name + u'_variance',
+                       name + u'_scale_factor']
+
+    @staticmethod
+    def is_batch_norm_expression(tf_node, node_inputs):
+        """ 
+        in order to extract batch normalization layers from a tensor flow
+        computational graph, we need to be able to match against the set
+        of operations which constitute batch norm.  This method performs
+        that pattern matching
+        """
+        # parse inputs
+        expr = node_inputs[0]
+        bias = node_inputs[1]
+   
+        # check for required sequence of ops
+        is_bn = (expr[-1] == 'mul') and \
+                (expr[0][-1] == 'div') and \
+                (expr[0][0][-1] == 'sub')
+
+        #TODO(sam): add in more robust checks
+        return is_bn
+
+
+    def display(self):
+        super(CaffeBatchNorm, self).display()
+        print("  c- use_global_stats: %s" % (self.use_global_stats,))
+        print("  c- moving_average_fraction: %s" % (self.moving_average_fraction,))
+        print("  c- eps: %s" % (self.eps))
+
+    def setBlob(self, model, i, blob):
+        assert(i < 3)
+        model.params[self.params[i]].value = blob
+        model.params[self.params[i]].shape = blob.shape
+
+    def reshape(self, model):
+        shape = model.vars[self.inputs[0]].shape
+        mean = model.params[self.params[0]].value
+        variance = model.params[self.params[1]].value
+        scale_factor = model.params[self.params[2]].value
+        for i in range(3): del model.params[self.params[i]]
+        self.params = [self.name + u'_mult',
+                       self.name + u'_bias',
+                       self.name + u'_moments']
+
+        model.addParam(self.params[0])
+        model.addParam(self.params[1])
+        model.addParam(self.params[2])
+
+        if shape:
+            mult = np.ones((shape[2],),dtype='float32')
+            bias = np.zeros((shape[2],),dtype='float32')
+            model.params[self.params[0]].value = mult
+            model.params[self.params[0]].shape = mult.shape
+            model.params[self.params[1]].value = bias
+            model.params[self.params[1]].shape = bias.shape
+
+        if mean.size:
+            moments = np.concatenate(
+                (mean.reshape(-1,1) / scale_factor,
+                 np.sqrt(variance.reshape(-1,1) / scale_factor + self.eps)),
+                axis=1)
+            model.params[self.params[2]].value = moments
+            model.params[self.params[2]].shape = moments.shape
+
+        model.vars[self.outputs[0]].shape = shape
+
+    def toMatlab(self):
+        mlayer = super(CaffeBatchNorm, self).toMatlab()
+        mlayer['type'][0] = u'dagnn.BatchNorm'
+        mlayer['block'][0] = dictToMatlabStruct(
+            {'epsilon': self.eps})
+        return mlayer
+
+    def toMatlabSimpleNN(self):
+        mlayer = super(CaffeBatchNorm, self).toMatlabSimpleNN()
+        mlayer['type'] = u'bnorm'
+        mlayer['epsilon'] = self.eps
+        return mlayer
+
+class McnPooling(McnLayer):
+
+    def __init__(self, name, tf_node, node_inputs, method):
+
+
+        # parse inputs
+        pool_expr = node_inputs
+        assert len(pool_expr) == 1, 'pooling layer takes a single input node'
+
+        # reformat kernel size to match mcn
+        tf_kernel_size = tf_node.ksize
+        param_format = tf_node.data_format
+        kernel_size_y = tf_kernel_size[param_format[0]]
+        kernel_size_x = tf_kernel_size[param_format[1]]
+        self.kernel_size = np.hstack((kernel_size_y, kernel_size_x))
+
+        # reformat kernel size to match mcn
+        tf_stride = tf_node.ksize
+        param_format = tf_node.data_format
+        stride_y = tf_stride[param_format[0]]
+        stride_x = tf_stride[param_format[1]]
+        self.stride = np.hstack((stride_y, stride_x))
+
+        #TODO(sam) fix properly on the first pass
+        self.pad = [1, 1, 1, 1]
+
+        # define input and output variable names
+        inputs = pool_expr[0][0].outputs
+        outputs = name
+
+        super().__init__(name, inputs, outputs)
+
+        self.method = method
+
+    def display(self):
+        super(CaffePooling, self).display()
+        print("  c- method: ".format(self.method))
+        print("  c- pad: {}".format(self.pad))
+        print("  c- kernel_size: {}".format(self.kernel_size))
+        print("  c- stride: {}".format(self.stride))
+
+    def reshape(self, model):
+        shape = model.vars[self.inputs[0]].shape
+        if not shape: return
+        # MatConvNet uses a slighly different definition of padding, which we think
+        # is the correct one (it corresponds to the filters)
+        self.pad_corrected = copy.deepcopy(self.pad)
+        for i in [0, 1]:
+            self.pad_corrected[1 + i*2] = min(
+                self.pad[1 + i*2] + self.stride[i] - 1,
+                self.kernel_size[i] - 1)
+        model.vars[self.outputs[0]].shape = \
+            getFilterOutputSize(shape[0:2],
+                                self.kernel_size,
+                                self.stride,
+                                self.pad_corrected) + shape[2:5]
+
+    def getTransforms(self, model):
+        return [[getFilterTransform(self.kernel_size, self.stride, self.pad)]]
+
+    def transpose(self, model):
+        self.kernel_size = reorder(self.kernel_size, [1,0])
+        self.stride = reorder(self.stride, [1,0])
+        self.pad = reorder(self.pad, [2,3,0,1])
+        if self.pad_corrected:
+            self.pad_corrected = reorder(self.pad_corrected, [2,3,0,1])
+
+    def toMatlab(self):
+        mlayer = super(CaffePooling, self).toMatlab()
+        mlayer['type'][0] = u'dagnn.Pooling'
+        mlayer['block'][0] = dictToMatlabStruct(
+            {'method': self.method,
+             'poolSize': row(self.kernel_size),
+             'stride': row(self.stride),
+             'pad': row(self.pad_corrected)})
+        if not self.pad_corrected:
+            print(('Warning: pad correction for layer {} could not be ',
+                 ('computed because the layer input shape could not be ', 
+                  'determined').format(self.name)))
+        return mlayer
