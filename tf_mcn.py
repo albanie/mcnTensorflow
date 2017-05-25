@@ -58,168 +58,110 @@ def dictToMatlabStruct(d):
     return y
 
 # --------------------------------------------------------------------
-#                                                       Basic TF Nodes
+#                                              Basic TF Node + helpers
 # --------------------------------------------------------------------
 
 class TFNode(object):
-    def __init__(self, name, input_names, input_types):
+    def __init__(self, name, input_names, op, **kwargs):
         self.name = name
         self.input_names = input_names
-        self.input_types = input_types
-        self.inputs = [] # used to store node references
+        self.op = op 
+        for key in kwargs:
+            setattr(self, key, kwargs[key])
+        self.inputs = [] # used later for graph construction
 
     def summary_str(self, obj_type):
         summary = """TF {} object:
         + name : {} 
         + input_names : {}
-        + input_types : {}"""
-        return summary.format(obj_type, self.name, self.input_names, self.input_types)
-        
+        + input_types : {}
+        + op : {}"""
+        return summary.format(obj_type, self.name, self.input_names, 
+                              self.input_types, self.op)
 
-class TFPlaceHolder(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+class TfValue(object):
+    def __init__(self, name):
+        self.name = name
+        self.shape = None
+        self.value = np.zeros(shape=(0,0), dtype='float32')
 
-    def __repr__(self):
-        return super().summary_str('PlaceHolder')
+    def toMatlab(self):
+        mparam = np.empty(shape=[1,], dtype=mparamdt)
+        mparam['name'][0] = self.name
+        mparam['value'][0] = self.value
+        return mparam
 
-class TFPad(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+class TFModel(object):
+    def __init__(self):
+        self.layers = OrderedDict()
+        self.vars = OrderedDict()
+        self.params = OrderedDict()
 
-    def __repr__(self):
-        return super().summary_str('Pad')
+    def addLayer(self, layer):
+        ename = layer.name
+        while ename in self.layers.keys():
+            ename = ename + 'x'
+        if layer.name != ename:
+            print('Warning: a layer with name {} was already found, using ',
+                  '{} instead'.format(layer.name, ename))
+            layer.name = ename
 
-class TFSub(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+        # add the variables and parameters associated with each layer to 
+        # the model, and set their values where applicable
+        for v in layer.inputs:  
+            self.addVar(v)
 
-    def __repr__(self):
-        return super().summary_str('Sub')
+        for v in layer.outputs: 
+            self.addVar(v)
 
-class TFRealDiv(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+        for p in layer.params: 
+            self.addParam(p, layer)
 
-    def __repr__(self):
-        return super().summary_str('RealDiv')
+        self.layers[layer.name] = layer
 
-class TFMul(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+    def addVar(self, name):
+        if name not in self.vars.keys():
+            self.vars[name] = TfValue(name)
 
-    def __repr__(self):
-        return super().summary_str('Mul')
+    def addParam(self, name, layer):
+        if name not in self.params.keys():
+            self.params[name] = TfValue(name)
+            self.params[name].value = layer.param_values[name]
 
-class TFMaximum(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+class ParseException(Exception):
+    pass
 
-    def __repr__(self):
-        return super().summary_str('Maximum')
+def parse_inputs(input_nodes, ops):
+    """
+    parse a list of input nodes and return them in the order 
+    given by `ops`. `Any` can be specified as a special argument 
+    to match any op - it must be supplied as the last argument
+    """
+    if len(input_nodes) != len(ops):
+        raise ParseException('number of inputs did not match ops')
 
-class TFIdentity(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+    wildcard = False
 
-    def __repr__(self):
-        return super().summary_str('Identity')
+    if 'Any' in ops:
+        if ops.index('Any') != len(ops) - 1:
+            raise ParseException('`Any` must be last arg')
+        wildcard = True
+        ops.pop()
 
-class TFNoOp(TFNode):
-    def __init__(self, *args):
-        super().__init__(*args)
+    out_nodes = []
+    for op in ops:
+        for node in input_nodes:
+            if node not in out_nodes and node.op == op:
+                out_nodes.append(node)
 
-    def __repr__(self):
-        return super().summary_str('NoOp')
+    if wildcard:
+        for node in input_nodes:
+            if node not in out_nodes:
+                out_nodes.append(node)
 
-class TFConst(TFNode):
-    def __init__(self, name, input_names, input_types, shape, value):
-        super().__init__(name, input_names, input_types)
-        self.shape = shape
-        self.value = value
-
-    def __repr__(self):
-        common = super().summary_str('Const')
-        summary = """{}
-        + shape : {}"""
-        return summary.format(common, self.shape)
-
-class TFConcatV2(TFNode):
-    def __init__(self, name, input_names, input_types, axis):
-        super().__init__(name, input_names, input_types)
-        self.axis = axis
-
-    def __repr__(self):
-        common = super().summary_str('ConcatV2')
-        summary = """{}
-        + axis : {}"""
-        return summary.format(common, self.axis)
-
-class TFBiasAdd(TFNode):
-    def __init__(self, name, input_names, input_types, data_format):
-        super().__init__(name, input_names, input_types)
-        self.data_format = data_format 
-
-    def __repr__(self):
-        common = super().summary_str('BiasAdd')
-        summary = """{}
-        + data_format : {}"""
-        return summary.format(common, self.data_format)
-
-class TFMaxPool(TFNode):
-    def __init__(self, name, input_names, stride, pad_type, ksize, input_types, 
-                                                                  data_format):
-        super().__init__(name, input_names, input_types)
-        self.stride = stride
-        self.ksize = ksize
-        self.pad_type = pad_type
-        self.data_format = data_format
-
-    def __repr__(self):
-        common = super().summary_str('MaxPool')
-        summary = """{}
-        + stride : {}
-        + ksize : {}
-        + pad_type : {}
-        + data_format : {}"""
-        return summary.format(common, self.stride, self.ksize, self.pad_type, 
-                                                             self.data_format)
-
-class TFConv2D(TFNode):
-    def __init__(self, name, input_names, stride, pad_type, input_types, 
-                                                                 data_format):
-        super().__init__(name, input_names, input_types)
-        self.stride = stride
-        self.pad_type = pad_type
-        self.data_format = data_format
-
-    def __repr__(self):
-        common = super().summary_str('Conv2D')
-        summary = """{}
-        + stride : {}
-        + pad_type : {}
-        + data_format : {}"""
-        return summary.format(common, self.stride, self.pad_type, 
-                                                             self.data_format)
-
-class TFExtractImagePatches(TFNode):
-    def __init__(self, name, input_names, rate, stride, pad_type, ksize, 
-                                                                  input_types):
-        super().__init__(name, input_names, input_types)
-        self.rate = rate
-        self.stride = stride
-        self.ksize = ksize
-        self.pad_type = pad_type
-
-    def __repr__(self):
-        common = super().summary_str('Const')
-        summary = """{}
-        + rate : {}
-        + stride : {}
-        + ksize : {}
-        + pad_type : {}"""
-        return summary.format(common, self.rate, self.stride, self.ksize, 
-                                                            self.pad_type)
+    if len(out_nodes) != len(ops) + wildcard:
+        raise ParseException('not enough nodes were matched')
+    return out_nodes
 
 # --------------------------------------------------------------------
 #                                                             TF Graph
@@ -239,8 +181,16 @@ class TFGraph(object):
 # --------------------------------------------------------------------
 #                                                   Matconvnet objects
 # --------------------------------------------------------------------
-class McnNode(object):
 
+def buildMcnLayerName(op, layerNames):
+    """ 
+    construct matconvnet layer name
+    """ 
+    num_prev_ops = sum([op in x for x in layerNames])
+    name = '{}_{}'.format(op, num_prev_ops + 1)
+    return name
+
+class McnNode(object):
     def __init__(self, name, value, op, input_nodes=None):
         self.name = name 
         self.value = value
@@ -254,22 +204,6 @@ class McnLayer(object):
         self.outputs = outputs
         self.params = []
         self.model = None
-
-    def reshape(self, model):
-        pass
-
-    def transpose(self, model):
-        raise NotImplementedError
-
-    def setBlob(self, model, i, blob):
-        raise NotImplementedError
-
-    def display(self):
-        print('Layer \'{}\''.format(self.name))
-        print('  +- type: {}'.format(self.__class__.__name__))
-        print('  +- inputs: {}'.format(self.inputs,))
-        print('  +- outputs: %s'.format(self.outputs,))
-        print('  +- params: %s'.format(self.params,))
 
     def toMatlab(self):
         mlayer = np.empty(shape=[1,],dtype=mlayerdt)
@@ -287,19 +221,11 @@ class McnConv(McnLayer):
         # parse the expression formed by input nodes
         assert len(input_nodes) == 2, 'conv layer expects two nodes as inputs'
 
-        # parse input nodes
-        for node in input_nodes:
-            if node.op == 'pad':
-                padding_node = node
-            elif node.op == 'const':
-                filter_node = node
-            else:
-                raise ValueError('unexpected input op {}'.format(node.op))
+        [pad_node, filter_node] = parse_inputs(input_nodes, ['Pad', 'Const'])
 
         # define input and output variable names
-        inputs = [padding_node.name]
+        inputs = [pad_node.name]
         outputs = [name]
-
         super().__init__(name, inputs, outputs)
 
         # determine filter dimensions
@@ -310,7 +236,7 @@ class McnConv(McnLayer):
         self.bias_term = 0 
 
         # reformat padding to match mcn
-        tf_pad = padding_node.value
+        tf_pad = pad_node.value
         param_format = tf_node.data_format
         pad_top_bottom = tf_pad[param_format[0],:]
         pad_left_right = tf_pad[param_format[1],:]
@@ -320,7 +246,7 @@ class McnConv(McnLayer):
         stride_x = tf_node.stride[param_format[0]]
         stride_y = tf_node.stride[param_format[1]]
         self.stride = np.hstack((stride_x, stride_y))
-        self.op = 'conv'
+        self.op = 'Conv2D'
         self.input_nodes = input_nodes
 
         # check options are correctly formatted
@@ -344,22 +270,6 @@ class McnConv(McnLayer):
         self.params = [filter_name,]
         self.param_values = {filter_name: filter_node.value}
 
-    def display(self):
-        super().display()
-        print("  +- filter dimension:", self.filter_depth)
-        print("  c- num_output (num filters): %s" % self.num_output)
-        print("  c- bias_term: %s" % self.bias_term)
-        print("  c- pad: %s" % (self.pad,))
-        print("  c- kernel_size: %s" % self.kernel_size)
-        print("  c- stride: %s" % (self.stride,))
-        print("  c- dilation: %s" % (self.dilation,))
-        print("  c- group: %s" % (self.group,))
-
-    def setParams(self, filters, data_format):
-        # TODO(sam): implement
-        model.params[self.params[i]].value = blob
-        model.params[self.params[i]].shape = blob.shape
-
     def toMatlab(self):
         size = list(self.kernel_size) + [self.filter_depth, self.num_output]
         mlayer = super().toMatlab()
@@ -376,18 +286,9 @@ class McnReLU(McnLayer):
     def __init__(self, name, tf_node, input_nodes):
         assert len(input_nodes) == 2, 'relu layer expects two nodes as inputs'
 
-        # parse inputs
-        for node in input_nodes:
-            if node.op == 'mul':
-                mul_node = node
-            else:
-                raw_node = node
-
-        for node in mul_node.input_nodes:
-            if node.op == 'const':
-                leak_node = node
-            else:
-                other_node = node
+        # parse the expressions formed by input nodes
+        [mul_node, raw_node] = parse_inputs(input_nodes, ['Mul', 'Any'])
+        [leak_node, other_node] = parse_inputs(mul_node.input_nodes, ['Const', 'Any'])
 
         inputs = raw_node.outputs
         outputs = [name]
@@ -403,16 +304,10 @@ class McnReLU(McnLayer):
         """ 
         pattern match to check for leaky relu
         """
-        # parse previous layer of inputs
-        for node in input_nodes:
-            if node.op == 'mul':
-                mul_node = node
-            else:
-                raw_node = node
-
-        # check that at least one node was a multiplier
-        if 'mul_node' not in locals(): 
-            return False
+        try :
+            [mul_node, raw_node] = parse_inputs(input_nodes, ['Mul', 'Any'])
+        except ParseException:
+            return False 
 
         #TODO(sam): add in more robust checks
         is_leaky_relu = id(raw_node) in [id(node) for node in mul_node.input_nodes]
@@ -455,7 +350,8 @@ class McnExtractImagePatches(McnLayer):
         outputs = [name]
 
         super().__init__(name, inputs, outputs)
-# reformat kernel size to match mcn
+
+        # reformat kernel size to match mcn
         tf_stride = tf_node.stride
         stride_y = tf_stride[param_format[0]]
         stride_x = tf_stride[param_format[1]]
@@ -483,36 +379,12 @@ class McnExtractImagePatches(McnLayer):
 class McnBatchNorm(McnLayer):
 
     def __init__(self, name, tf_node, input_nodes, eps=1e-5):
-        # parse the expression formed by input nodes
-        assert len(input_nodes) == 2, 'batch norm layer expects two nodes as inputs'
 
-        # parse inputs
-        for node in input_nodes:
-            if node.op == 'const':
-                bias_node = node
-            elif node.op == 'mul':
-                mul_node = node
-
-        # parse inputs
-        for node in mul_node.input_nodes:
-            if node.op == 'const':
-                gain_node = node
-            elif node.op == 'div':
-                div_node = node
-
-        # parse inputs
-        for node in div_node.input_nodes:
-            if node.op == 'const':
-                var_node = node
-            elif node.op == 'sub':
-                sub_node = node
-
-        # parse inputs
-        for node in sub_node.input_nodes:
-            if node.op == 'const':
-                mean_node = node
-            elif node.op == 'conv':
-                conv_node = node
+        # parse the expressions formed by input nodes
+        [bias_node, mul_node] = parse_inputs(input_nodes, ['Const', 'Mul'])
+        [gain_node, div_node] = parse_inputs(mul_node.input_nodes, ['Const', 'RealDiv'])
+        [var_node, sub_node] = parse_inputs(div_node.input_nodes, ['Const', 'Sub'])
+        [mean_node, conv_node] = parse_inputs(sub_node.input_nodes, ['Const', 'Conv2D'])
 
         # parse inputs
         self.bias_term = bias_node.value
@@ -547,29 +419,21 @@ class McnBatchNorm(McnLayer):
         that pattern matching
         """
 
-        # parse inputs
-        for node in input_nodes:
-            if node.op == 'const':
-                bias_node = node
-            elif node.op == 'mul':
-                mul_node = node
-            else:
-                return False # unexpected format from batch norm
-              
+        try :
+            [bias_node, mul_node] = parse_inputs(input_nodes, ['Const', 'Mul'])
+        except ParseException:
+            return False # unexpected format from batch norm
+
         # check for required sequence of ops
-        expected_div_ops = {'const', 'div'}
+        expected_div_ops = {'Const', 'RealDiv'}
         div_ops = set([node.op for node in mul_node.input_nodes])
 
-        # parse previous layer of inputs
-        for node in mul_node.input_nodes:
-            if node.op == 'const':
-                var_node = node
-            elif node.op == 'div':
-                div_node = node
-            else:
-                return False # unexpected format from batch norm
+        try :
+            [var_node, div_node] = parse_inputs(mul_node.input_nodes, ['Const', 'RealDiv'])
+        except ParseException:
+            return False # unexpected format from batch norm
 
-        expected_sub_ops = {'const', 'sub'}
+        expected_sub_ops = {'Const', 'Sub'}
         sub_ops = set([node.op for node in div_node.input_nodes])
         is_bn = (sub_ops == expected_sub_ops) and (div_ops == expected_div_ops)
 
@@ -617,13 +481,6 @@ class McnPooling(McnLayer):
         self.method = method
         self.op = 'pool'
 
-    def display(self):
-        super().display()
-        print("  c- method: ".format(self.method))
-        print("  c- pad: {}".format(self.pad))
-        print("  c- kernel_size: {}".format(self.kernel_size))
-        print("  c- stride: {}".format(self.stride))
-
     def toMatlab(self):
         mlayer = super().toMatlab()
         mlayer['type'][0] = u'dagnn.Pooling'
@@ -633,61 +490,3 @@ class McnPooling(McnLayer):
              'stride': row(self.stride),
              'pad': row(self.pad)})
         return mlayer
-
-class TfValue(object):
-
-    def __init__(self, name):
-        self.name = name
-        self.shape = None
-        self.value = np.zeros(shape=(0,0), dtype='float32')
-
-    def toMatlab(self):
-        mparam = np.empty(shape=[1,], dtype=mparamdt)
-        mparam['name'][0] = self.name
-        mparam['value'][0] = self.value
-        return mparam
-
-    def toMatlabSimpleNN(self):
-        return self.value
-
-    def hasValue(self):
-        return reduce(mul, self.value.shape, 1) > 0
-
-
-class TFModel(object):
-
-    def __init__(self):
-        self.layers = OrderedDict()
-        self.vars = OrderedDict()
-        self.params = OrderedDict()
-
-    def addLayer(self, layer):
-        ename = layer.name
-        while ename in self.layers.keys():
-            ename = ename + 'x'
-        if layer.name != ename:
-            print('Warning: a layer with name {} was already found, using ',
-                  '{} instead'.format(layer.name, ename))
-            layer.name = ename
-
-        # add the variables and parameters associated with each layer to 
-        # the model, and set their values where applicable
-        for v in layer.inputs:  
-            self.addVar(v)
-
-        for v in layer.outputs: 
-            self.addVar(v)
-
-        for p in layer.params: 
-            self.addParam(p, layer)
-
-        self.layers[layer.name] = layer
-
-    def addVar(self, name):
-        if name not in self.vars.keys():
-            self.vars[name] = TfValue(name)
-
-    def addParam(self, name, layer):
-        if name not in self.params.keys():
-            self.params[name] = TfValue(name)
-            self.params[name].value = layer.param_values[name]
