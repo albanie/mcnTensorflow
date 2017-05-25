@@ -16,6 +16,48 @@ import copy
 import collections
 
 # --------------------------------------------------------------------
+#                  MatConvNet in NumPy (A.V magic from caffe importer)
+# --------------------------------------------------------------------
+
+mlayerdt = [('name',object),
+            ('type',object),
+            ('inputs',object),
+            ('outputs',object),
+            ('params',object),
+            ('block',object)]
+
+mparamdt = [('name',object),
+            ('value',object)]
+
+minputdt = [('name',object),
+            ('size',object)]
+
+def reorder(aList, order):
+    return [aList[i] for i in order]
+
+def row(x):
+    return np.array(x,dtype=float).reshape(1,-1)
+
+def rowarray(x):
+    return x.reshape(1,-1)
+
+def rowcell(x):
+    return np.array(x,dtype=object).reshape(1,-1)
+
+def dictToMatlabStruct(d):
+    if not d:
+        return np.zeros((0,))
+    dt = []
+    for x in d.keys():
+        pair = (x,object)
+        if isinstance(d[x], np.ndarray): pair = (x,type(d[x]))
+        dt.append(pair)
+    y = np.empty((1,),dtype=dt)
+    for x in d.keys():
+        y[x][0] = d[x]
+    return y
+
+# --------------------------------------------------------------------
 #                                                       Basic TF Nodes
 # --------------------------------------------------------------------
 
@@ -255,8 +297,8 @@ class McnConv(McnLayer):
                 raise ValueError('unexpected input op {}'.format(node.op))
 
         # define input and output variable names
-        inputs = padding_node.name
-        outputs = name
+        inputs = [padding_node.name]
+        outputs = [name]
 
         super().__init__(name, inputs, outputs)
 
@@ -293,13 +335,14 @@ class McnConv(McnLayer):
         # TODO(sam) - handle dilated convs properly
         self.dilation = dilation
 
+        self.filter_depth = filter_node.value.shape[2]
+        self.num_output = filter_node.value.shape[3]
+
         # set param names and store weights on the layer - note that
-        # params are not set on the shared model until all the layers
-        # have been constructed
-        self.params = [name + '_filter']
-        if self.bias_term: self.params.append(name + '_bias')
-        self.filters = filter_node.value
-        self.filter_depth = filter_node.value.shape[3]
+        # biases may be set later
+        filter_name = name + '_filter'
+        self.params = [filter_name,]
+        self.param_values = {filter_name: filter_node.value}
 
     def display(self):
         super().display()
@@ -314,9 +357,20 @@ class McnConv(McnLayer):
 
     def setParams(self, filters, data_format):
         # TODO(sam): implement
-        ipdb.set_trace()
         model.params[self.params[i]].value = blob
         model.params[self.params[i]].shape = blob.shape
+
+    def toMatlab(self):
+        size = list(self.kernel_size) + [self.filter_depth, self.num_output]
+        mlayer = super().toMatlab()
+        mlayer['type'][0] = u'dagnn.Conv'
+        mlayer['block'][0] = dictToMatlabStruct(
+            {'hasBias': self.bias_term,
+             'size': row(size),
+             'pad': row(self.pad),
+             'stride': row(self.stride),
+             'dilate': row(self.dilation)})
+        return mlayer
 
 class McnReLU(McnLayer):
     def __init__(self, name, tf_node, input_nodes):
@@ -336,7 +390,7 @@ class McnReLU(McnLayer):
                 other_node = node
 
         inputs = raw_node.outputs
-        outputs = name
+        outputs = [name]
 
         super().__init__(name, inputs, outputs)
 
@@ -374,8 +428,9 @@ class McnConcat(McnLayer):
     def __init__(self, name, tf_node, input_nodes):
         assert len(input_nodes) == 3, 'concat layer expects three nodes as inputs'
 
-        inputs = [node.outputs for node in input_nodes[:2]]
-        outputs = name
+        inputs = [node.outputs[0] for node in input_nodes[:2]]
+        assert sum([len(node.outputs) for node in input_nodes[:2]]) == 2, 'more outputs not yet supported'
+        outputs = [name]
  
         super().__init__(name, inputs, outputs)
 
@@ -397,11 +452,10 @@ class McnExtractImagePatches(McnLayer):
         param_format = [1,2,3,0] # this is currently the form of the TF layer, but may change
 
         inputs = src_node.outputs
-        outputs = name
+        outputs = [name]
 
         super().__init__(name, inputs, outputs)
-
-        # reformat kernel size to match mcn
+# reformat kernel size to match mcn
         tf_stride = tf_node.stride
         stride_y = tf_stride[param_format[0]]
         stride_x = tf_stride[param_format[1]]
@@ -424,10 +478,6 @@ class McnExtractImagePatches(McnLayer):
             {'stride': row(self.stride),
              'rate': row(self.rate),
              'pad': row(self.pad)})
-        if not self.pad_corrected:
-            print(('Warning: pad correction for layer {} could not be ',
-                 ('computed because the layer input shape could not be ', 
-                  'determined').format(self.name)))
         return mlayer
 
 class McnBatchNorm(McnLayer):
@@ -472,15 +522,21 @@ class McnBatchNorm(McnLayer):
 
         # define input and output variable names
         inputs = conv_node.outputs
-        outputs = name
+        outputs = [name]
 
         super().__init__(name, inputs, outputs)
 
         self.eps = eps
         self.op = 'batch_norm'
-        self.params = [name + u'_mean',
-                       name + u'_variance',
-                       name + u'_scale_factor']
+
+        # set params
+        mean_name = name + u'_mean'
+        variance_name = name + u'_variance'
+        scale_factor_name = name + u'_scale_factor'
+        self.params = [mean_name, variance_name, scale_factor_name]
+        self.param_values = {mean_name: self.mean, 
+                             variance_name: self.variance, 
+                             scale_factor_name: self.scale_factor}
 
     @staticmethod
     def is_batch_norm_expression(tf_node, input_nodes):
@@ -520,43 +576,6 @@ class McnBatchNorm(McnLayer):
         #TODO(sam): add in more robust checks
         return is_bn
 
-    def setBlob(self, model, i, blob):
-        assert(i < 3)
-        model.params[self.params[i]].value = blob
-        model.params[self.params[i]].shape = blob.shape
-
-    def reshape(self, model):
-        shape = model.vars[self.inputs[0]].shape
-        mean = model.params[self.params[0]].value
-        variance = model.params[self.params[1]].value
-        scale_factor = model.params[self.params[2]].value
-        for i in range(3): del model.params[self.params[i]]
-        self.params = [self.name + u'_mult',
-                       self.name + u'_bias',
-                       self.name + u'_moments']
-
-        model.addParam(self.params[0])
-        model.addParam(self.params[1])
-        model.addParam(self.params[2])
-
-        if shape:
-            mult = np.ones((shape[2],),dtype='float32')
-            bias = np.zeros((shape[2],),dtype='float32')
-            model.params[self.params[0]].value = mult
-            model.params[self.params[0]].shape = mult.shape
-            model.params[self.params[1]].value = bias
-            model.params[self.params[1]].shape = bias.shape
-
-        if mean.size:
-            moments = np.concatenate(
-                (mean.reshape(-1,1) / scale_factor,
-                 np.sqrt(variance.reshape(-1,1) / scale_factor + self.eps)),
-                axis=1)
-            model.params[self.params[2]].value = moments
-            model.params[self.params[2]].shape = moments.shape
-
-        model.vars[self.outputs[0]].shape = shape
-
     def toMatlab(self):
         mlayer = super().toMatlab()
         mlayer['type'][0] = u'dagnn.BatchNorm'
@@ -567,7 +586,6 @@ class McnBatchNorm(McnLayer):
 class McnPooling(McnLayer):
 
     def __init__(self, name, tf_node, input_nodes, method):
-
         assert len(input_nodes) == 1, 'pooling layer takes a single input node'
 
         # parse inputs
@@ -592,7 +610,7 @@ class McnPooling(McnLayer):
 
         # define input and output variable names
         inputs = pool_node.outputs
-        outputs = name
+        outputs = [name]
 
         super().__init__(name, inputs, outputs)
 
@@ -600,48 +618,76 @@ class McnPooling(McnLayer):
         self.op = 'pool'
 
     def display(self):
-        super(CaffePooling, self).display()
+        super().display()
         print("  c- method: ".format(self.method))
         print("  c- pad: {}".format(self.pad))
         print("  c- kernel_size: {}".format(self.kernel_size))
         print("  c- stride: {}".format(self.stride))
 
-    def reshape(self, model):
-        shape = model.vars[self.inputs[0]].shape
-        if not shape: return
-        # MatConvNet uses a slighly different definition of padding, which we think
-        # is the correct one (it corresponds to the filters)
-        self.pad_corrected = copy.deepcopy(self.pad)
-        for i in [0, 1]:
-            self.pad_corrected[1 + i*2] = min(
-                self.pad[1 + i*2] + self.stride[i] - 1,
-                self.kernel_size[i] - 1)
-        model.vars[self.outputs[0]].shape = \
-            getFilterOutputSize(shape[0:2],
-                                self.kernel_size,
-                                self.stride,
-                                self.pad_corrected) + shape[2:5]
-
-    def getTransforms(self, model):
-        return [[getFilterTransform(self.kernel_size, self.stride, self.pad)]]
-
-    def transpose(self, model):
-        self.kernel_size = reorder(self.kernel_size, [1,0])
-        self.stride = reorder(self.stride, [1,0])
-        self.pad = reorder(self.pad, [2,3,0,1])
-        if self.pad_corrected:
-            self.pad_corrected = reorder(self.pad_corrected, [2,3,0,1])
-
     def toMatlab(self):
-        mlayer = super(CaffePooling, self).toMatlab()
+        mlayer = super().toMatlab()
         mlayer['type'][0] = u'dagnn.Pooling'
         mlayer['block'][0] = dictToMatlabStruct(
             {'method': self.method,
              'poolSize': row(self.kernel_size),
              'stride': row(self.stride),
-             'pad': row(self.pad_corrected)})
-        if not self.pad_corrected:
-            print(('Warning: pad correction for layer {} could not be ',
-                 ('computed because the layer input shape could not be ', 
-                  'determined').format(self.name)))
+             'pad': row(self.pad)})
         return mlayer
+
+class TfValue(object):
+
+    def __init__(self, name):
+        self.name = name
+        self.shape = None
+        self.value = np.zeros(shape=(0,0), dtype='float32')
+
+    def toMatlab(self):
+        mparam = np.empty(shape=[1,], dtype=mparamdt)
+        mparam['name'][0] = self.name
+        mparam['value'][0] = self.value
+        return mparam
+
+    def toMatlabSimpleNN(self):
+        return self.value
+
+    def hasValue(self):
+        return reduce(mul, self.value.shape, 1) > 0
+
+
+class TFModel(object):
+
+    def __init__(self):
+        self.layers = OrderedDict()
+        self.vars = OrderedDict()
+        self.params = OrderedDict()
+
+    def addLayer(self, layer):
+        ename = layer.name
+        while ename in self.layers.keys():
+            ename = ename + 'x'
+        if layer.name != ename:
+            print('Warning: a layer with name {} was already found, using ',
+                  '{} instead'.format(layer.name, ename))
+            layer.name = ename
+
+        # add the variables and parameters associated with each layer to 
+        # the model, and set their values where applicable
+        for v in layer.inputs:  
+            self.addVar(v)
+
+        for v in layer.outputs: 
+            self.addVar(v)
+
+        for p in layer.params: 
+            self.addParam(p, layer)
+
+        self.layers[layer.name] = layer
+
+    def addVar(self, name):
+        if name not in self.vars.keys():
+            self.vars[name] = TfValue(name)
+
+    def addParam(self, name, layer):
+        if name not in self.params.keys():
+            self.params[name] = TfValue(name)
+            self.params[name].value = layer.param_values[name]
